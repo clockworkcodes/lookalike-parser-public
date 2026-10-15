@@ -1,0 +1,15 @@
+# Instagram session — full account access, never commit
+session.json
+*.session.json
+
+.env
+.env.*
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.csv
+.DS_Store
+
+# local tooling
+.claude/

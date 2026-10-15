@@ -1,0 +1,14 @@
+.git
+.gitignore
+.venv
+venv
+__pycache__
+*.pyc
+tests
+session.json
+.env
+.env.*
+*.csv
+generate_session.py
+render.yaml
+README.md
