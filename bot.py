@@ -441,6 +441,12 @@ def webapp_keyboard() -> InlineKeyboardMarkup | None:
     )
 
 
+def ig_link(username: str) -> str:
+    """Кликабельная ссылка на профиль Instagram (иначе Telegram сам сделает @ник ссылкой на Telegram)."""
+    username = html.escape(username or "")
+    return f'<a href="https://instagram.com/{username}">@{username}</a>'
+
+
 def format_duration(seconds: float) -> str:
     seconds = int(seconds)
     hours, rem = divmod(seconds, 3600)
@@ -477,7 +483,7 @@ def render_status(final: bool = False) -> str:
     found = len(STATE.results)
     mode = "🔬 Глубокий (био, ссылки, подписчики)" if p.deep_check else "⚡ Быстрый (username + имя)"
     keywords = ", ".join(html.escape(k) for k in p.keywords) if p.keywords else "—"
-    seeds = ", ".join(f"@{html.escape(s)}" for s in p.seeds)
+    seeds = ", ".join(ig_link(s) for s in p.seeds)
 
     lines = [
         f"<b>{title}</b>",
@@ -500,7 +506,8 @@ def render_status(final: bool = False) -> str:
         f"⏱ {format_duration(time.monotonic() - STATE.started_at)}",
     ]
     if not final and STATE.current:
-        lines.append(f"📍 Сейчас: {html.escape(STATE.current)}")
+        current = re.sub(r"@([A-Za-z0-9._]+)", lambda m: ig_link(m.group(1)), html.escape(STATE.current))
+        lines.append(f"📍 Сейчас: {current}")
     if final and STATE.error_text:
         lines += ["", f"<i>{html.escape(STATE.error_text[:300])}</i>"]
     return "\n".join(lines)
@@ -917,8 +924,7 @@ def build_caption(rows: list[dict[str, Any]], params: JobParams) -> str:
     mode = "глубокий" if params.deep_check else "быстрый"
     lines = [f"<b>{title}</b>", f"Найдено: <b>{len(rows)}</b> · режим: {mode}", ""]
     for row in rows[:CAPTION_PREVIEW]:
-        username = html.escape(row["username"])
-        lines.append(f'<a href="https://instagram.com/{username}">@{username}</a>')
+        lines.append(ig_link(row["username"]))
     if len(rows) > CAPTION_PREVIEW:
         lines.append(f"<i>…и ещё {len(rows) - CAPTION_PREVIEW} в файле</i>")
     if STATE.error_text:
@@ -1107,29 +1113,29 @@ async def cmd_diag(message: Message, command: CommandObject) -> None:
     cl = ig_client
     try:
         await message.answer(
-            f"🔬 Проверяю источники для @{html.escape(username)}… "
+            f"🔬 Проверяю источники для {ig_link(username)}… "
             "С паузами 5–15 сек это займёт 1–2 минуты."
         )
         try:
             user_id = str(await asyncio.to_thread(cl.user_id_from_username, username))
         except Exception as exc:
-            await message.answer(f"❌ @{html.escape(username)}: {type(exc).__name__}: {html.escape(str(exc)[:200])}")
+            await message.answer(f"❌ {ig_link(username)}: {type(exc).__name__}: {html.escape(str(exc)[:200])}")
             return
 
-        lines = [f"<b>Диагностика @{html.escape(username)}</b> (pk {user_id})", ""]
+        lines = [f"<b>Диагностика</b> {ig_link(username)} (pk {user_id})", ""]
         for name in RELATED_SOURCES:
             try:
                 users, info = await asyncio.to_thread(run_related_source, cl, name, user_id)
             except Exception as exc:
                 lines.append(f"❌ <b>{name}</b>: {type(exc).__name__}: {html.escape(str(exc)[:150])}")
                 continue
-            sample = ", ".join(f"@{html.escape(u.username)}" for u in users[:5]) or "—"
+            sample = ", ".join(ig_link(u.username) for u in users[:5]) or "—"
             mark = "✅" if users else "⚪️"
             lines.append(f"{mark} <b>{name}</b>: {len(users)} профилей ({html.escape(info)})\n    {sample}")
 
         try:
             following = await asyncio.to_thread(fetch_following, cl, user_id)
-            sample = ", ".join(f"@{html.escape(u.username)}" for u in following[:5]) or "—"
+            sample = ", ".join(ig_link(u.username) for u in following[:5]) or "—"
             lines.append(f"↪️ <b>подписки</b> (запасной путь): {len(following)}\n    {sample}")
         except Exception as exc:
             lines.append(f"❌ <b>подписки</b>: {type(exc).__name__}: {html.escape(str(exc)[:150])}")

@@ -296,6 +296,13 @@ class ExportTests(unittest.TestCase):
         self.assertIn("username,full_name,profile_url", text.splitlines()[0])
         self.assertIn("'=HYPERLINK", text)
 
+    def test_status_links_point_to_instagram(self):
+        app.STATE.params = app.build_params("prod.zzy", 50, "", False)
+        app.STATE.current = "рекомендации @prod.zzy (уровень 0)"
+        text = app.render_status()
+        self.assertEqual(text.count('<a href="https://instagram.com/prod.zzy">@prod.zzy</a>'), 2)
+        self.assertNotRegex(text, r"(?<![>/])@prod\.zzy(?!<)")
+
     def test_caption_lists_first_15(self):
         rows = [app.base_row(short(i, f"user{i}"), "seed", 1) for i in range(20)]
         caption = app.build_caption(rows, app.STATE.params)
