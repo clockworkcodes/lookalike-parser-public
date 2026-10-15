@@ -919,7 +919,9 @@ HELP_TEXT = (
 
 @router.message(CommandStart())
 @router.message(Command("help"))
-async def cmd_start(message: Message) -> None:
+async def cmd_start(message: Message, bot: Bot) -> None:
+    if not bot_ui_ready:
+        await setup_bot_ui(bot)
     text = HELP_TEXT
     if not WEBAPP_URL:
         text += "\n\n⚠️ RENDER_EXTERNAL_URL не задан — кнопка Mini App недоступна."
@@ -1079,7 +1081,12 @@ def build_web_app(bot: Bot) -> web.Application:
 # --------------------------------------------------------------------------- #
 
 
+bot_ui_ready = False
+
+
 async def setup_bot_ui(bot: Bot) -> None:
+    """Команды и кнопка меню для чата владельца. До первого /start Telegram отвечает «chat not found»."""
+    global bot_ui_ready
     scope = BotCommandScopeChat(chat_id=ALLOWED_USER_ID)
     try:
         await bot.set_my_commands(
@@ -1097,6 +1104,12 @@ async def setup_bot_ui(bot: Bot) -> None:
                 chat_id=ALLOWED_USER_ID,
                 menu_button=MenuButtonWebApp(text="Парсер", web_app=WebAppInfo(url=WEBAPP_URL)),
             )
+        bot_ui_ready = True
+    except TelegramBadRequest as exc:
+        if "chat not found" in str(exc).lower():
+            logger.info("Меню бота настроится после первого /start от владельца")
+        else:
+            logger.warning("Не удалось настроить меню бота: %s", exc)
     except TelegramAPIError as exc:
         logger.warning("Не удалось настроить меню бота: %s", exc)
 
