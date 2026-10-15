@@ -45,6 +45,7 @@ py -3.12 generate_session.py
 
 - `/parse user1, user2`
 - `/parse seeds=user1,user2 limit=80 kw=prod,beats deep=1 min=1000 max=50000`
+- `/diag username` — какие источники похожих аккаунтов отвечают для этого профиля
 - `/status`, `/stop`
 
 ## Тесты

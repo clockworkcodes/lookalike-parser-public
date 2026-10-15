@@ -62,7 +62,7 @@ from instagrapi.exceptions import (
     RateLimitError,
     UserNotFound,
 )
-from instagrapi.extractors import extract_user_short
+from instagrapi.types import UserShort
 
 # --------------------------------------------------------------------------- #
 # Конфигурация
@@ -260,6 +260,8 @@ class JobState:
     next_status_at: float = 0.0
     finish_reason: str = ""
     error_text: str = ""
+    related_ok: int = 0
+    related_empty: int = 0
 
     def reset(self, params: JobParams, chat_id: int) -> None:
         self.is_running = True
@@ -280,6 +282,8 @@ class JobState:
         self.next_status_at = 0.0
         self.finish_reason = ""
         self.error_text = ""
+        self.related_ok = 0
+        self.related_empty = 0
 
     def request_cancel(self) -> None:
         self.cancel_requested = True
@@ -614,33 +618,111 @@ FATAL_OR_LIMIT_ERRORS = (
 )
 
 
+USER_SHORT_FIELDS = ("username", "full_name", "is_private", "is_verified")
+
+
+def extract_users_from_payload(payload: Any, exclude_pk: str = "") -> list[UserShort]:
+    """
+    Достаёт профили из сырого ответа Instagram независимо от имени ключа
+    (users / suggestions / items / вложенные node): любой dict с username и числовым pk.
+    """
+    found: dict[str, dict[str, Any]] = {}
+
+    def walk(node: Any, depth: int) -> None:
+        if depth > 8:
+            return
+        if isinstance(node, dict):
+            pk = node.get("pk") or node.get("pk_id") or node.get("id")
+            if node.get("username") and pk is not None and str(pk).isdigit():
+                pk = str(pk)
+                if pk != exclude_pk and pk not in found:
+                    data = {key: node[key] for key in USER_SHORT_FIELDS if node.get(key) is not None}
+                    data["pk"] = pk
+                    found[pk] = data
+                return
+            for value in node.values():
+                walk(value, depth + 1)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value, depth + 1)
+
+    walk(payload, 0)
+    users = []
+    for data in found.values():
+        try:
+            users.append(UserShort(**data))
+        except Exception as exc:
+            logger.debug("Пропущен профиль %s: %s", data.get("username"), exc)
+    return users
+
+
+def _related_chaining(cl: Client, user_id: str) -> Any:
+    """Private API discover/chaining — «Похожие аккаунты» под профилем в приложении."""
+    return cl.chaining(user_id)
+
+
+def _related_fbsearch(cl: Client, user_id: str) -> Any:
+    """Private API fbsearch/accounts_recs — «Рекомендуемые» при открытии профиля."""
+    return cl.private_request(
+        "fbsearch/accounts_recs/",
+        params={"target_user_id": user_id, "include_friendship_status": "true"},
+    )
+
+
+def _related_gql(cl: Client, user_id: str) -> Any:
+    """Публичный GraphQL edge_chaining (legacy query_hash, Instagram всё чаще его режет)."""
+    return cl.user_related_profiles_gql(user_id)
+
+
+RELATED_SOURCES: dict[str, Callable[[Client, str], Any]] = {
+    "chaining": _related_chaining,
+    "fbsearch": _related_fbsearch,
+    "gql": _related_gql,
+}
+# Сколько раз источник дал результат — удачный источник пробуется первым (экономит запросы)
+related_source_hits: dict[str, int] = {name: 0 for name in RELATED_SOURCES}
+
+
+def describe_payload(raw: Any) -> str:
+    if isinstance(raw, dict):
+        return "keys=" + ",".join(list(raw.keys())[:8])
+    if isinstance(raw, list):
+        return f"list[{len(raw)}]"
+    return type(raw).__name__
+
+
+def run_related_source(cl: Client, name: str, user_id: str) -> tuple[list[Any], str]:
+    raw = RELATED_SOURCES[name](cl, user_id)
+    if isinstance(raw, list) and all(isinstance(item, UserShort) for item in raw):
+        users = [user for user in raw if str(user.pk) != user_id]
+    else:
+        users = extract_users_from_payload(raw, exclude_pk=user_id)
+    return users, describe_payload(raw)
+
+
 def fetch_related(cl: Client, user_id: str) -> list[Any]:
     """
-    Похожие профили: сначала GraphQL edge_chaining (user_related_profiles_gql),
-    при ошибке или пустом ответе — private API discover/chaining (как в приложении).
+    Похожие профили из трёх источников по очереди: discover/chaining, fbsearch/accounts_recs,
+    GraphQL edge_chaining. Возвращает первый непустой результат.
     Синхронная функция: вызывается через asyncio.to_thread.
     """
-    try:
-        users = cl.user_related_profiles_gql(user_id)
+    order = sorted(RELATED_SOURCES, key=lambda source: -related_source_hits[source])
+    for name in order:
+        try:
+            users, info = run_related_source(cl, name, user_id)
+        except FATAL_OR_LIMIT_ERRORS:
+            raise
+        except InvalidTargetUser:
+            logger.info("Похожие для %s через %s: Instagram отказал (Not eligible for chaining)", user_id, name)
+            continue
+        except Exception as exc:
+            logger.info("Похожие для %s через %s: %s: %s", user_id, name, type(exc).__name__, str(exc)[:200])
+            continue
+        logger.info("Похожие для %s через %s: %d профилей (%s)", user_id, name, len(users), info)
         if users:
+            related_source_hits[name] += 1
             return users
-    except FATAL_OR_LIMIT_ERRORS:
-        raise
-    except Exception as exc:
-        logger.info("GraphQL chaining недоступен для %s (%s), пробую private API", user_id, type(exc).__name__)
-
-    try:
-        raw = cl.chaining(user_id)
-    except InvalidTargetUser:
-        return []
-    users = []
-    for item in (raw or {}).get("users", []) or []:
-        if isinstance(item, dict) and (item.get("pk") or item.get("id")):
-            try:
-                users.append(extract_user_short(item))
-            except Exception as exc:
-                logger.debug("Пропущен профиль из chaining: %s", exc)
-    return users
+    return []
 
 
 def base_row(user: Any, source: str, depth: int) -> dict[str, Any]:
@@ -738,7 +820,9 @@ async def crawl(bot: Bot, cl: Client, params: JobParams) -> str:
 
         related = await ig_call(fetch_related, cl, pk, label=f"related @{username}")
         if not related:
+            STATE.related_empty += 1
             continue
+        STATE.related_ok += 1
 
         for user in related:
             if STATE.should_stop:
@@ -762,6 +846,17 @@ async def crawl(bot: Bot, cl: Client, params: JobParams) -> str:
         return "cancel"
     if STATE.is_full:
         return "limit"
+    if STATE.related_ok == 0:
+        STATE.error_text = (
+            "Instagram не отдал похожие аккаунты ни одним способом (chaining, fbsearch, GraphQL). "
+            f"Проверьте источники командой /diag {params.seeds[0]} или попробуйте другой seed."
+        )
+    elif not STATE.results and params.keywords:
+        STATE.error_text = (
+            f"Просмотрено {STATE.checked} похожих профилей, но ни один не подошёл под ключевые слова. "
+            "В быстром режиме слова ищутся только в username и имени — попробуйте глубокий режим "
+            "или другие слова."
+        )
     return "exhausted"
 
 
@@ -862,7 +957,7 @@ async def run_job(bot: Bot) -> None:
 
 async def start_job(bot: Bot, params: JobParams, chat_id: int) -> tuple[bool, int, str]:
     """Запускает задачу. Возвращает (ok, http_status, message)."""
-    if STATE.is_running:
+    if STATE.is_running or diag_running:
         return False, 409, "Уже выполняется другая задача. Остановите её или дождитесь завершения."
     if ig_client is None:
         return False, 503, f"Instagram-клиент не готов: {ig_init_error or 'неизвестная ошибка'}"
@@ -912,6 +1007,7 @@ HELP_TEXT = (
     "• <b>kw</b> — ключевые слова через запятую\n"
     "• <b>deep=1</b> — глубокий анализ (био, категория, подписчики)\n"
     "• <b>min / max</b> — диапазон подписчиков (только в глубоком режиме)\n\n"
+    "/diag username — проверить, какие источники рекомендаций отвечают\n"
     "/status — показать прогресс\n"
     "/stop — остановить и выгрузить найденное"
 )
@@ -956,6 +1052,53 @@ async def cmd_stop(message: Message, bot: Bot) -> None:
     STATE.request_cancel()
     await update_status(bot, force=True)
     await message.answer("⏳ Останавливаю, файл с найденным придёт через несколько секунд.")
+
+
+diag_running = False
+
+
+@router.message(Command("diag"))
+async def cmd_diag(message: Message, command: CommandObject) -> None:
+    """Проверяет каждый источник похожих аккаунтов по отдельности и показывает, что вернул Instagram."""
+    global diag_running
+    username = normalize_username(command.args or "")
+    if not username:
+        await message.answer("Укажите аккаунт: <code>/diag username</code>")
+        return
+    if STATE.is_running or diag_running:
+        await message.answer("Сейчас идёт другая задача — дождитесь её завершения или /stop.")
+        return
+    if ig_client is None:
+        await message.answer(f"❌ Instagram-клиент не готов: {html.escape(ig_init_error or 'неизвестная ошибка')}")
+        return
+
+    diag_running = True
+    cl = ig_client
+    try:
+        await message.answer(
+            f"🔬 Проверяю источники для @{html.escape(username)}… "
+            "С паузами 5–15 сек это займёт 1–2 минуты."
+        )
+        try:
+            user_id = str(await asyncio.to_thread(cl.user_id_from_username, username))
+        except Exception as exc:
+            await message.answer(f"❌ @{html.escape(username)}: {type(exc).__name__}: {html.escape(str(exc)[:200])}")
+            return
+
+        lines = [f"<b>Диагностика @{html.escape(username)}</b> (pk {user_id})", ""]
+        for name in RELATED_SOURCES:
+            try:
+                users, info = await asyncio.to_thread(run_related_source, cl, name, user_id)
+            except Exception as exc:
+                lines.append(f"❌ <b>{name}</b>: {type(exc).__name__}: {html.escape(str(exc)[:150])}")
+                continue
+            sample = ", ".join(f"@{html.escape(u.username)}" for u in users[:5]) or "—"
+            mark = "✅" if users else "⚪️"
+            lines.append(f"{mark} <b>{name}</b>: {len(users)} профилей ({html.escape(info)})\n    {sample}")
+        await asyncio.to_thread(save_session, cl)
+        await message.answer("\n".join(lines))
+    finally:
+        diag_running = False
 
 
 @router.message(Command("status"))
@@ -1095,6 +1238,7 @@ async def setup_bot_ui(bot: Bot) -> None:
                 BotCommand(command="parse", description="Запустить парсинг командой"),
                 BotCommand(command="status", description="Прогресс текущей задачи"),
                 BotCommand(command="stop", description="Остановить и выгрузить"),
+                BotCommand(command="diag", description="Проверить источники похожих аккаунтов"),
                 BotCommand(command="help", description="Справка"),
             ],
             scope=scope,
