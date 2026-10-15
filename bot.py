@@ -262,6 +262,7 @@ class JobState:
     error_text: str = ""
     related_ok: int = 0
     related_empty: int = 0
+    following_fallbacks: int = 0
 
     def reset(self, params: JobParams, chat_id: int) -> None:
         self.is_running = True
@@ -284,6 +285,7 @@ class JobState:
         self.error_text = ""
         self.related_ok = 0
         self.related_empty = 0
+        self.following_fallbacks = 0
 
     def request_cancel(self) -> None:
         self.cancel_requested = True
@@ -725,6 +727,18 @@ def fetch_related(cl: Client, user_id: str) -> list[Any]:
     return []
 
 
+FOLLOWING_FALLBACK_LIMIT = 50
+
+
+def fetch_following(cl: Client, user_id: str) -> list[Any]:
+    """
+    Запасной путь для seed с закрытыми рекомендациями («Not eligible for chaining»):
+    его подписки — обычно коллеги, продюсеры и лейбл, у них рекомендации чаще открыты.
+    Синхронная функция: вызывается через asyncio.to_thread.
+    """
+    return cl.user_following_v1(user_id, amount=FOLLOWING_FALLBACK_LIMIT)
+
+
 def base_row(user: Any, source: str, depth: int) -> dict[str, Any]:
     username = getattr(user, "username", "") or ""
     return {
@@ -819,10 +833,21 @@ async def crawl(bot: Bot, cl: Client, params: JobParams) -> str:
         await update_status(bot)
 
         related = await ig_call(fetch_related, cl, pk, label=f"related @{username}")
-        if not related:
+        source = username
+        if related:
+            STATE.related_ok += 1
+        else:
             STATE.related_empty += 1
-            continue
-        STATE.related_ok += 1
+            if depth == 0 and not STATE.should_stop:
+                STATE.current = f"рекомендации @{username} закрыты — беру его подписки"
+                await update_status(bot, force=True)
+                related = await ig_call(fetch_following, cl, pk, label=f"following @{username}")
+                if related:
+                    STATE.following_fallbacks += 1
+                    source = f"{username} (подписки)"
+                    logger.info("Seed @%s: рекомендации закрыты, взято %d подписок", username, len(related))
+            if not related:
+                continue
 
         for user in related:
             if STATE.should_stop:
@@ -837,7 +862,7 @@ async def crawl(bot: Bot, cl: Client, params: JobParams) -> str:
             STATE.queue_size = len(queue)
             STATE.checked += 1
 
-            row = await evaluate_candidate(bot, cl, user, params, source=username, depth=depth + 1)
+            row = await evaluate_candidate(bot, cl, user, params, source=source, depth=depth + 1)
             if row and not STATE.is_full:
                 STATE.results.append(row)
             await update_status(bot)
@@ -846,10 +871,16 @@ async def crawl(bot: Bot, cl: Client, params: JobParams) -> str:
         return "cancel"
     if STATE.is_full:
         return "limit"
-    if STATE.related_ok == 0:
+    if STATE.related_ok == 0 and STATE.following_fallbacks == 0:
         STATE.error_text = (
-            "Instagram не отдал похожие аккаунты ни одним способом (chaining, fbsearch, GraphQL). "
+            "Instagram не отдал похожие аккаунты ни одним способом (chaining, fbsearch, GraphQL), "
+            "а подписки seed недоступны. "
             f"Проверьте источники командой /diag {params.seeds[0]} или попробуйте другой seed."
+        )
+    elif STATE.related_ok == 0:
+        STATE.error_text = (
+            "Рекомендации закрыты и у seed, и у его подписок — собраны только подписки seed. "
+            "Попробуйте другой seed (например, продюсера или коллегу этого артиста)."
         )
     elif not STATE.results and params.keywords:
         STATE.error_text = (
@@ -1095,6 +1126,20 @@ async def cmd_diag(message: Message, command: CommandObject) -> None:
             sample = ", ".join(f"@{html.escape(u.username)}" for u in users[:5]) or "—"
             mark = "✅" if users else "⚪️"
             lines.append(f"{mark} <b>{name}</b>: {len(users)} профилей ({html.escape(info)})\n    {sample}")
+
+        try:
+            following = await asyncio.to_thread(fetch_following, cl, user_id)
+            sample = ", ".join(f"@{html.escape(u.username)}" for u in following[:5]) or "—"
+            lines.append(f"↪️ <b>подписки</b> (запасной путь): {len(following)}\n    {sample}")
+        except Exception as exc:
+            lines.append(f"❌ <b>подписки</b>: {type(exc).__name__}: {html.escape(str(exc)[:150])}")
+
+        if any("not eligible" in line.lower() for line in lines):
+            lines += [
+                "",
+                "<i>«Not eligible for chaining» — у аккаунта отключены рекомендации похожих. "
+                "Бот возьмёт его подписки и продолжит граф от них.</i>",
+            ]
         await asyncio.to_thread(save_session, cl)
         await message.answer("\n".join(lines))
     finally:

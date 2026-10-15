@@ -77,6 +77,13 @@ class FakeInstagram:
         self.calls = []
         self.dumps = 0
 
+    following_graph = {}
+
+    def user_following_v1(self, user_id, amount=0):
+        self.calls.append(("following", user_id))
+        users = self.following_graph.get(user_id, [])
+        return users[:amount] if amount else users
+
     def private_request(self, endpoint, params=None, **kwargs):
         assert endpoint == "fbsearch/accounts_recs/", endpoint
         user_id = params["target_user_id"]
@@ -381,6 +388,27 @@ class CrawlTests(unittest.IsolatedAsyncioTestCase):
         related_calls = [c for c in cl.calls if c[0] in ("gql", "chaining", "fbsearch")]
         # seed: chaining → fbsearch → gql (успех); дальше gql идёт первым
         self.assertEqual(related_calls[:4], [("chaining", "1"), ("fbsearch", "1"), ("gql", "1"), ("gql", "2")])
+
+    async def test_seed_with_disabled_recommendations_uses_following(self):
+        from instagrapi.exceptions import InvalidTargetUser
+
+        class NotEligibleSeed(FakeInstagram):
+            def chaining(self, user_id):
+                if user_id == "1":
+                    self.calls.append(("chaining", user_id))
+                    raise InvalidTargetUser("Not eligible for chaining.")
+                return super().chaining(user_id)
+
+        cl = NotEligibleSeed({}, {"seed": "1"}, chaining_graph={"2": [{"pk": "4", "username": "peer_of_a"}]})
+        cl.following_graph = {"1": [short(2, "followed_a"), short(3, "followed_b")]}
+        await self.run_job(cl, app.build_params("seed", 10, "", False))
+
+        rows = {r["username"]: r for r in app.STATE.results}
+        self.assertEqual(set(rows), {"followed_a", "followed_b", "peer_of_a"})
+        self.assertEqual(rows["followed_a"]["source"], "seed (подписки)")
+        self.assertEqual(rows["peer_of_a"]["source"], "followed_a")
+        self.assertEqual(app.STATE.following_fallbacks, 1)
+        self.assertNotIn(("following", "2"), cl.calls, "запасной путь только для seed")
 
     async def test_no_recommendations_explained(self):
         cl = FakeInstagram({}, {"seed": "1"})
