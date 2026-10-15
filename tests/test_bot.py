@@ -67,14 +67,21 @@ def short(pk, username, full_name=""):
 class FakeInstagram:
     """Граф рекомендаций: pk -> список UserShort."""
 
-    def __init__(self, graph, usernames, infos=None, gql_error=None, chaining_graph=None):
+    def __init__(self, graph, usernames, infos=None, gql_error=None, chaining_graph=None, fbsearch_graph=None):
         self.graph = graph
         self.usernames = usernames
         self.infos = infos or {}
         self.gql_error = gql_error
         self.chaining_graph = chaining_graph or {}
+        self.fbsearch_graph = fbsearch_graph or {}
         self.calls = []
         self.dumps = 0
+
+    def private_request(self, endpoint, params=None, **kwargs):
+        assert endpoint == "fbsearch/accounts_recs/", endpoint
+        user_id = params["target_user_id"]
+        self.calls.append(("fbsearch", user_id))
+        return {"users": self.fbsearch_graph.get(user_id, []), "status": "ok"}
 
     def dump_settings(self, path):
         self.dumps += 1
@@ -174,6 +181,19 @@ class ParamsTests(unittest.TestCase):
         p = app.parse_command_args("user1, user2")
         self.assertEqual(p.seeds, ["user1", "user2"])
         self.assertFalse(p.deep_check)
+
+    def test_extract_users_from_any_payload_shape(self):
+        payload = {
+            "status": "ok",
+            "suggestions": [
+                {"user": {"pk": "11", "username": "nested_one", "full_name": "N1", "is_verified": True}},
+                {"node": {"id": "12", "username": "graph_node"}},
+            ],
+            "users": [{"pk_id": "13", "username": "pk_id_user"}, {"pk": "99", "username": "target_self"}],
+            "junk": {"id": "abc", "username": "not_numeric"},
+        }
+        users = app.extract_users_from_payload(payload, exclude_pk="99")
+        self.assertEqual(sorted(u.username for u in users), ["graph_node", "nested_one", "pk_id_user"])
 
     def test_keyword_matching(self):
         self.assertTrue(app.matches_keywords([], "x"))
@@ -287,6 +307,8 @@ class CrawlTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self._sleep = app.interruptible_sleep
         app.interruptible_sleep = no_sleep
+        for name in app.related_source_hits:
+            app.related_source_hits[name] = 0
         self.bot = FakeBot()
 
     def tearDown(self):
@@ -344,6 +366,33 @@ class CrawlTests(unittest.IsolatedAsyncioTestCase):
         cl = FakeInstagram({}, {"seed": "1"}, gql_error=RuntimeError("gated"), chaining_graph=chaining)
         await self.run_job(cl, app.build_params("seed", 10, "", False))
         self.assertEqual([r["username"] for r in app.STATE.results], ["from_chaining"])
+
+    async def test_falls_back_to_fbsearch(self):
+        fb = {"1": [{"pk": 8, "username": "from_fbsearch", "full_name": "FB"}]}
+        cl = FakeInstagram({}, {"seed": "1"}, gql_error=RuntimeError("gated"), fbsearch_graph=fb)
+        await self.run_job(cl, app.build_params("seed", 10, "", False))
+        self.assertEqual([r["username"] for r in app.STATE.results], ["from_fbsearch"])
+        self.assertEqual(app.related_source_hits["fbsearch"], 1)
+
+    async def test_successful_source_is_tried_first(self):
+        graph = {"1": [short(2, "a")], "2": [short(3, "b")]}
+        cl = FakeInstagram(graph, {"seed": "1"})
+        await self.run_job(cl, app.build_params("seed", 10, "", False))
+        related_calls = [c for c in cl.calls if c[0] in ("gql", "chaining", "fbsearch")]
+        # seed: chaining → fbsearch → gql (успех); дальше gql идёт первым
+        self.assertEqual(related_calls[:4], [("chaining", "1"), ("fbsearch", "1"), ("gql", "1"), ("gql", "2")])
+
+    async def test_no_recommendations_explained(self):
+        cl = FakeInstagram({}, {"seed": "1"})
+        await self.run_job(cl, app.build_params("seed", 10, "", False))
+        self.assertEqual(app.STATE.results, [])
+        self.assertIn("/diag seed", app.STATE.error_text)
+        self.assertIn("/diag seed", self.bot.sent[-1].text)
+
+    async def test_keyword_miss_explained(self):
+        cl = FakeInstagram({"1": [short(2, "someone")]}, {"seed": "1"})
+        await self.run_job(cl, app.build_params("seed", 10, "beats", False))
+        self.assertIn("глубокий режим", app.STATE.error_text)
 
     async def test_login_required_is_fatal_but_delivers(self):
         class Breaking(FakeInstagram):
