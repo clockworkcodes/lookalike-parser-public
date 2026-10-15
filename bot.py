@@ -1309,6 +1309,29 @@ async def setup_bot_ui(bot: Bot) -> None:
         logger.warning("Не удалось настроить меню бота: %s", exc)
 
 
+KEEPALIVE_INTERVAL = 10 * 60
+
+
+async def keep_alive(url: str, interval: float = KEEPALIVE_INTERVAL) -> None:
+    """
+    Render Free усыпляет сервис через 15 минут без ВХОДЯЩИХ HTTP-запросов. Long polling —
+    исходящие запросы и не считается, поэтому бот засыпал даже посреди парсинга.
+    Пинг собственного публичного URL идёт через внешний прокси Render и считается входящим.
+    """
+    import aiohttp
+
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                async with session.get(url) as resp:
+                    if resp.status != 200:
+                        logger.warning("Keep-alive %s: HTTP %s", url, resp.status)
+            except Exception as exc:
+                logger.warning("Keep-alive %s: %s: %s", url, type(exc).__name__, exc)
+
+
 async def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN не задан")
@@ -1331,6 +1354,11 @@ async def main() -> None:
     await site.start()
     logger.info("Веб-сервер запущен на порту %d, Mini App: %s", PORT, WEBAPP_URL or "—")
 
+    keepalive_task = None
+    if RENDER_EXTERNAL_URL:
+        keepalive_task = asyncio.create_task(keep_alive(f"{RENDER_EXTERNAL_URL}/health"), name="keep-alive")
+        logger.info("Keep-alive: пинг %s/health каждые %d мин", RENDER_EXTERNAL_URL, KEEPALIVE_INTERVAL // 60)
+
     try:
         try:
             me = await bot.get_me()
@@ -1339,10 +1367,13 @@ async def main() -> None:
             raise SystemExit(1)
         logger.info("Авторизован как @%s", me.username)
         await setup_bot_ui(bot)
-        await bot.delete_webhook(drop_pending_updates=True)
+        # Не выбрасываем сообщения, пришедшие во время сна/рестарта — они обработаются после старта
+        await bot.delete_webhook(drop_pending_updates=False)
         logger.info("Бот запущен (long polling)")
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
+        if keepalive_task:
+            keepalive_task.cancel()
         if STATE.task and not STATE.task.done():
             STATE.task.cancel()
         if ig_client is not None:

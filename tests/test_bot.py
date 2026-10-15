@@ -462,7 +462,10 @@ class CrawlTests(unittest.IsolatedAsyncioTestCase):
         cl = FakeInstagram(graph, {"seed": "1"})
         app.ig_client = cl
         await app.start_job(self.bot, app.build_params("seed", 200, "", False), chat_id=42)
-        await asyncio.sleep(0.05)
+        for _ in range(500):
+            if app.STATE.results:
+                break
+            await asyncio.sleep(0.01)
         app.STATE.request_cancel()
         await asyncio.wait_for(app.STATE.task, timeout=5)
         self.assertEqual(app.STATE.finish_reason, "cancel")
@@ -573,6 +576,33 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
     async def test_stale_init_data(self):
         status, _ = await self.post(self.payload(initData=sign_init_data(42, auth_date=time.time() - 2 * 86400)))
         self.assertEqual(status, 401)
+
+    async def test_keep_alive_pings_health(self):
+        from aiohttp import web
+
+        hits = []
+
+        async def health(request):
+            hits.append(request.path)
+            return web.json_response({"status": "ok"})
+
+        ping_app = web.Application()
+        ping_app.router.add_get("/health", health)
+        server = TestServer(ping_app)
+        await server.start_server()
+        try:
+            task = asyncio.create_task(app.keep_alive(str(server.make_url("/health")), interval=0.05))
+            for _ in range(300):
+                if len(hits) >= 3:
+                    break
+                await asyncio.sleep(0.01)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        finally:
+            await server.close()
+        self.assertGreaterEqual(len(hits), 3)
+        self.assertEqual(set(hits), {"/health"})
 
     async def test_validation_error(self):
         status, body = await self.post(self.payload(seed_accounts="!!!"))
