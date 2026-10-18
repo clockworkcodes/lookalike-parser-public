@@ -144,6 +144,10 @@ def sign_init_data(user_id, token=app.BOT_TOKEN, auth_date=None):
     return urlencode(fields)
 
 
+async def _record(store, text):
+    store.append(text)
+
+
 async def no_sleep(*args, **kwargs):
     await asyncio.sleep(0)
 
@@ -441,6 +445,42 @@ class CrawlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(app.STATE.finish_reason, "error")
         self.assertIn("IG_SESSION_JSON", app.STATE.error_text)
         self.assertEqual(len(self.bot.documents), 1)
+
+        # Сессия отключена: новые задачи не стучатся в Instagram с мёртвой сессией
+        self.assertIsNone(app.ig_client)
+        ok, status, text = await app.start_job(self.bot, app.build_params("seed", 10, "", False), 42)
+        self.assertFalse(ok)
+        self.assertEqual(status, 503)
+        self.assertIn("отозвал сессию", text)
+
+    async def test_diag_stops_at_login_required(self):
+        class Dead(FakeInstagram):
+            def chaining(self, user_id):
+                self.calls.append(("chaining", user_id))
+                raise LoginRequired("login_required")
+
+        cl = Dead({}, {"seed": "1"})
+        app.ig_client = cl
+        replies = []
+        message = SimpleNamespace(answer=lambda text, **kw: _record(replies, text))
+        await app.cmd_diag(message, SimpleNamespace(args="seed"))
+
+        self.assertNotIn(("fbsearch", "1"), cl.calls, "после LoginRequired запросы прекращаются")
+        self.assertNotIn(("following", "1"), cl.calls)
+        self.assertIsNone(app.ig_client)
+        self.assertIn("отозвал сессию", replies[-1])
+
+    async def test_error_without_results_is_not_called_empty_search(self):
+        class Dead(FakeInstagram):
+            def user_related_profiles_gql(self, user_id):
+                raise LoginRequired("login_required")
+
+            def chaining(self, user_id):
+                raise LoginRequired("login_required")
+
+        await self.run_job(Dead({}, {"seed": "1"}), app.build_params("seed", 10, "", False))
+        self.assertIn("остановлена из-за ошибки", self.bot.sent[-1].text)
+        self.assertNotIn("Подходящих профилей не найдено", self.bot.sent[-1].text)
 
     async def test_rate_limit_is_survived(self):
         class Limited(FakeInstagram):

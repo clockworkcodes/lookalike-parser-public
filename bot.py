@@ -145,6 +145,23 @@ ig_client: Client | None = None
 ig_init_error: str | None = None
 
 
+def mark_session_dead(exc: Exception) -> str:
+    """
+    Instagram отозвал сессию. Дальнейшие запросы с ней только злят антифрод
+    (LoginRequired → PleaseWaitFewMinutes → чекпоинт), поэтому клиент отключается
+    до перезапуска с новым IG_SESSION_JSON.
+    """
+    global ig_client, ig_init_error
+    ig_client = None
+    ig_init_error = (
+        f"Instagram отозвал сессию ({type(exc).__name__}). Новые задачи заблокированы, "
+        "чтобы не нарваться на чекпоинт. Сгенерируйте новую сессию через generate_session.py "
+        "(с тем же прокси, что IG_PROXY) и обновите IG_SESSION_JSON на Render."
+    )
+    logger.error("Instagram: %s", ig_init_error)
+    return ig_init_error
+
+
 def session_id_of(settings: dict[str, Any]) -> str | None:
     auth = settings.get("authorization_data") or {}
     return auth.get("sessionid") or (settings.get("cookies") or {}).get("sessionid")
@@ -594,10 +611,7 @@ async def ig_call(func: Callable[..., Any], *args: Any, label: str = "") -> Any:
     try:
         result = await asyncio.to_thread(func, *args)
     except (LoginRequired, ChallengeRequired) as exc:
-        raise FatalJobError(
-            f"Сессия Instagram недействительна ({type(exc).__name__}). "
-            "Сгенерируйте новую через generate_session.py и обновите IG_SESSION_JSON."
-        ) from exc
+        raise FatalJobError(mark_session_dead(exc)) from exc
     except UserNotFound:
         logger.info("IG [%s]: пользователь не найден", label)
         return None
@@ -942,7 +956,10 @@ async def deliver_results(bot: Bot) -> None:
     rows = list(STATE.results)
 
     if not rows:
-        text = "😶 Подходящих профилей не найдено."
+        if STATE.finish_reason == "error":
+            text = "⚠️ Задача остановлена из-за ошибки — ничего собрать не успели."
+        else:
+            text = "😶 Подходящих профилей не найдено."
         if STATE.error_text:
             text += f"\n\n<i>{html.escape(STATE.error_text[:300])}</i>"
         await tg_call(lambda: bot.send_message(chat_id, text))
@@ -1118,27 +1135,39 @@ async def cmd_diag(message: Message, command: CommandObject) -> None:
         )
         try:
             user_id = str(await asyncio.to_thread(cl.user_id_from_username, username))
+        except (LoginRequired, ChallengeRequired) as exc:
+            await message.answer(f"❌ {html.escape(mark_session_dead(exc))}")
+            return
         except Exception as exc:
             await message.answer(f"❌ {ig_link(username)}: {type(exc).__name__}: {html.escape(str(exc)[:200])}")
             return
 
         lines = [f"<b>Диагностика</b> {ig_link(username)} (pk {user_id})", ""]
-        for name in RELATED_SOURCES:
+        checks: list[tuple[str, str, Callable[[], Any]]] = [
+            (name, name, lambda name=name: run_related_source(cl, name, user_id)) for name in RELATED_SOURCES
+        ]
+        checks.append(("following", "подписки", lambda: (fetch_following(cl, user_id), "запасной путь")))
+
+        for key, title, check in checks:
             try:
-                users, info = await asyncio.to_thread(run_related_source, cl, name, user_id)
+                users, info = await asyncio.to_thread(check)
+            except (LoginRequired, ChallengeRequired) as exc:
+                lines += [f"❌ <b>{title}</b>: {type(exc).__name__}", "", f"<i>{html.escape(mark_session_dead(exc))}</i>"]
+                break
+            except (PleaseWaitFewMinutes, RateLimitError, FeedbackRequired) as exc:
+                lines += [
+                    f"❌ <b>{title}</b>: {type(exc).__name__}",
+                    "",
+                    "<i>Instagram просит подождать — проверка остановлена, чтобы не усугублять. "
+                    "Повторите через 1–2 часа.</i>",
+                ]
+                break
             except Exception as exc:
-                lines.append(f"❌ <b>{name}</b>: {type(exc).__name__}: {html.escape(str(exc)[:150])}")
+                lines.append(f"❌ <b>{title}</b>: {type(exc).__name__}: {html.escape(str(exc)[:150])}")
                 continue
             sample = ", ".join(ig_link(u.username) for u in users[:5]) or "—"
-            mark = "✅" if users else "⚪️"
-            lines.append(f"{mark} <b>{name}</b>: {len(users)} профилей ({html.escape(info)})\n    {sample}")
-
-        try:
-            following = await asyncio.to_thread(fetch_following, cl, user_id)
-            sample = ", ".join(ig_link(u.username) for u in following[:5]) or "—"
-            lines.append(f"↪️ <b>подписки</b> (запасной путь): {len(following)}\n    {sample}")
-        except Exception as exc:
-            lines.append(f"❌ <b>подписки</b>: {type(exc).__name__}: {html.escape(str(exc)[:150])}")
+            mark = "↪️" if key == "following" else ("✅" if users else "⚪️")
+            lines.append(f"{mark} <b>{title}</b>: {len(users)} профилей ({html.escape(info)})\n    {sample}")
 
         if any("not eligible" in line.lower() for line in lines):
             lines += [
@@ -1146,7 +1175,8 @@ async def cmd_diag(message: Message, command: CommandObject) -> None:
                 "<i>«Not eligible for chaining» — у аккаунта отключены рекомендации похожих. "
                 "Бот возьмёт его подписки и продолжит граф от них.</i>",
             ]
-        await asyncio.to_thread(save_session, cl)
+        if ig_client is not None:
+            await asyncio.to_thread(save_session, cl)
         await message.answer("\n".join(lines))
     finally:
         diag_running = False
