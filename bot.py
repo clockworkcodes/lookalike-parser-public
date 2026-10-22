@@ -59,6 +59,7 @@ from instagrapi.exceptions import (
     InvalidTargetUser,
     LoginRequired,
     PleaseWaitFewMinutes,
+    ProxyAddressIsBlocked,
     RateLimitError,
     UserNotFound,
 )
@@ -143,6 +144,40 @@ CSV_FIELDS = [
 
 ig_client: Client | None = None
 ig_init_error: str | None = None
+
+
+ig_status = "не проверялась"
+
+
+def verify_instagram() -> None:
+    """
+    Один лёгкий запрос при старте (account_info), чтобы в логах и в /start было сразу видно,
+    жива ли сессия и работает ли прокси. Синхронная функция: вызывается через asyncio.to_thread.
+    """
+    global ig_status
+    cl = ig_client
+    if cl is None:
+        ig_status = f"❌ {ig_init_error}"
+        return
+
+    via = "через прокси" if IG_PROXY else "без прокси (IP дата-центра Render)"
+    try:
+        me = cl.account_info()
+    except (LoginRequired, ChallengeRequired) as exc:
+        ig_status = f"❌ {mark_session_dead(exc)}"
+        return
+    except ProxyAddressIsBlocked:
+        ig_status = "❌ Instagram заблокировал IP прокси — нужен другой прокси (резидентный/мобильный)"
+    except (PleaseWaitFewMinutes, RateLimitError, FeedbackRequired) as exc:
+        ig_status = f"⚠️ Instagram ограничил аккаунт ({type(exc).__name__}) — подождите 1–2 часа"
+    except Exception as exc:
+        hint = " Проверьте IG_PROXY: формат http://логин:пароль@ip:порт, прокси оплачен и онлайн." if IG_PROXY else ""
+        ig_status = f"❌ Instagram недоступен ({type(exc).__name__}: {str(exc)[:150]}).{hint}"
+    else:
+        ig_status = f"✅ @{me.username}, {via}"
+        logger.info("Instagram: проверка пройдена — %s", ig_status)
+        return
+    logger.error("Instagram: проверка не пройдена — %s", ig_status)
 
 
 def mark_session_dead(exc: Exception) -> str:
@@ -1076,7 +1111,9 @@ async def cmd_start(message: Message, bot: Bot) -> None:
     if not WEBAPP_URL:
         text += "\n\n⚠️ RENDER_EXTERNAL_URL не задан — кнопка Mini App недоступна."
     if ig_client is None:
-        text += f"\n\n⚠️ Instagram: {html.escape(ig_init_error or 'не инициализирован')}"
+        text += f"\n\n<b>Instagram:</b> ❌ {html.escape(ig_init_error or 'не инициализирован')}"
+    else:
+        text += f"\n\n<b>Instagram:</b> {html.escape(ig_status)}"
     await message.answer(text, reply_markup=webapp_keyboard())
 
 
@@ -1397,6 +1434,7 @@ async def main() -> None:
             raise SystemExit(1)
         logger.info("Авторизован как @%s", me.username)
         await setup_bot_ui(bot)
+        await asyncio.to_thread(verify_instagram)
         # Не выбрасываем сообщения, пришедшие во время сна/рестарта — они обработаются после старта
         await bot.delete_webhook(drop_pending_updates=False)
         logger.info("Бот запущен (long polling)")

@@ -270,6 +270,37 @@ class SessionTests(unittest.TestCase):
         self.assertIsNone(app.ig_client)
         self.assertIn("sessionid", app.ig_init_error)
 
+    def check(self, client):
+        app.ig_client = client
+        app.ig_init_error = None
+        app.verify_instagram()
+        return app.ig_status
+
+    def test_verify_ok(self):
+        client = SimpleNamespace(account_info=lambda: SimpleNamespace(username="prodbykwiz"))
+        self.assertTrue(self.check(client).startswith("✅ @prodbykwiz"))
+
+    def test_verify_dead_session_disables_client(self):
+        def boom():
+            raise LoginRequired("login_required")
+
+        status = self.check(SimpleNamespace(account_info=boom))
+        self.assertIn("отозвал сессию", status)
+        self.assertIsNone(app.ig_client)
+
+    def test_verify_proxy_failure_hint(self):
+        def boom():
+            raise ConnectionError("Cannot connect to proxy")
+
+        old_proxy = app.IG_PROXY
+        app.IG_PROXY = "http://u:p@1.2.3.4:8000"
+        try:
+            status = self.check(SimpleNamespace(account_info=boom))
+        finally:
+            app.IG_PROXY = old_proxy
+        self.assertIn("Проверьте IG_PROXY", status)
+        self.assertIsNotNone(app.ig_client, "сетевой сбой не убивает сессию")
+
     def test_save_session_is_atomic_dump(self):
         app.IG_SESSION_JSON = json.dumps(settings_with("abc", "ENV"))
         app.init_instagram()
