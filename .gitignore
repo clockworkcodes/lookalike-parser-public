@@ -13,3 +13,6 @@ __pycache__/
 
 # local tooling
 .claude/
+
+# example config is committed
+!.env.example

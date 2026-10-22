@@ -78,6 +78,28 @@ logging.getLogger("instagrapi").setLevel(logging.WARNING)
 logging.getLogger("public_request").setLevel(logging.WARNING)
 logging.getLogger("private_request").setLevel(logging.WARNING)
 
+def load_env_file(path: Path) -> None:
+    """
+    Локальный запуск: читает KEY=VALUE из .env рядом с bot.py.
+    Уже заданные переменные окружения (например, на Render) не перезаписываются.
+    """
+    if not path.exists():
+        return
+    for raw in path.read_text(encoding="utf-8-sig").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key, value = key.strip(), value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if key:
+            os.environ.setdefault(key, value)
+
+
+load_env_file(Path(__file__).resolve().parent / ".env")
+
+
 def _env_int(name: str, default: int) -> int:
     raw = os.getenv(name, "").strip()
     if not raw:
@@ -233,31 +255,38 @@ def init_instagram() -> None:
     Приоритет: session.json, сохранённый ботом ранее (в нём свежие cookies),
     если это та же сессия, что в IG_SESSION_JSON. Если в переменной окружения
     другая сессия (её перегенерировали) — берётся она и перезаписывает файл.
+    Без IG_SESSION_JSON (запуск на ПК) берётся session.json от generate_session.py.
     """
     global ig_client, ig_init_error
 
     if not IG_SESSION_JSON:
-        ig_init_error = "переменная IG_SESSION_JSON не задана"
-        logger.error("Instagram: %s", ig_init_error)
-        return
-
-    try:
-        env_settings = json.loads(IG_SESSION_JSON)
-    except json.JSONDecodeError as exc:
-        ig_init_error = f"IG_SESSION_JSON — невалидный JSON ({exc})"
-        logger.error("Instagram: %s", ig_init_error)
-        return
-    if not isinstance(env_settings, dict) or not session_id_of(env_settings):
-        ig_init_error = "в IG_SESSION_JSON нет sessionid — сгенерируйте сессию через generate_session.py"
-        logger.error("Instagram: %s", ig_init_error)
-        return
-
-    saved = read_saved_session()
-    if saved and session_id_of(saved) == session_id_of(env_settings):
-        source = "session.json (сохранённая ботом)"
+        saved = read_saved_session()
+        if not saved or not session_id_of(saved):
+            ig_init_error = (
+                "нет сессии: задайте IG_SESSION_JSON или положите session.json рядом с bot.py "
+                "(создаётся командой generate_session.py)"
+            )
+            logger.error("Instagram: %s", ig_init_error)
+            return
+        source = "session.json"
     else:
-        SESSION_PATH.write_text(json.dumps(env_settings), encoding="utf-8")
-        source = "IG_SESSION_JSON"
+        try:
+            env_settings = json.loads(IG_SESSION_JSON)
+        except json.JSONDecodeError as exc:
+            ig_init_error = f"IG_SESSION_JSON — невалидный JSON ({exc})"
+            logger.error("Instagram: %s", ig_init_error)
+            return
+        if not isinstance(env_settings, dict) or not session_id_of(env_settings):
+            ig_init_error = "в IG_SESSION_JSON нет sessionid — сгенерируйте сессию через generate_session.py"
+            logger.error("Instagram: %s", ig_init_error)
+            return
+
+        saved = read_saved_session()
+        if saved and session_id_of(saved) == session_id_of(env_settings):
+            source = "session.json (сохранённая ботом)"
+        else:
+            SESSION_PATH.write_text(json.dumps(env_settings), encoding="utf-8")
+            source = "IG_SESSION_JSON"
 
     try:
         cl = Client()

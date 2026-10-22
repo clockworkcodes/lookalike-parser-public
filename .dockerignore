@@ -12,3 +12,7 @@ session.json
 generate_session.py
 render.yaml
 README.md
+start.bat
+start.ps1
+.env.example
+.gitattributes

@@ -264,6 +264,35 @@ class SessionTests(unittest.TestCase):
         app.init_instagram()
         self.assertEqual(app.ig_client.mid, "ENV")
 
+    def test_local_run_uses_session_file_without_env(self):
+        app.IG_SESSION_JSON = ""
+        app.SESSION_PATH.write_text(json.dumps(settings_with("abc", "LOCAL")), encoding="utf-8")
+        app.init_instagram()
+        self.assertIsNotNone(app.ig_client, app.ig_init_error)
+        self.assertEqual(app.ig_client.mid, "LOCAL")
+
+    def test_no_session_anywhere_explains_how_to_fix(self):
+        app.IG_SESSION_JSON = ""
+        app.init_instagram()
+        self.assertIsNone(app.ig_client)
+        self.assertIn("generate_session.py", app.ig_init_error)
+
+    def test_env_file_loading(self):
+        env_file = TMP_DIR / ".env"
+        env_file.write_text(
+            "﻿# comment\nLKP_TEST_A=hello\nLKP_TEST_B = \"quoted value\"\nLKP_TEST_C=keep\nbroken line\n",
+            encoding="utf-8",
+        )
+        os.environ["LKP_TEST_C"] = "already set"
+        try:
+            app.load_env_file(env_file)
+            self.assertEqual(os.environ["LKP_TEST_A"], "hello")
+            self.assertEqual(os.environ["LKP_TEST_B"], "quoted value")
+            self.assertEqual(os.environ["LKP_TEST_C"], "already set", "переменные Render не перезаписываются")
+        finally:
+            for key in ("LKP_TEST_A", "LKP_TEST_B", "LKP_TEST_C"):
+                os.environ.pop(key, None)
+
     def test_session_without_sessionid_rejected(self):
         app.IG_SESSION_JSON = json.dumps({"uuids": {}})
         app.init_instagram()
